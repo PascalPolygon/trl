@@ -272,10 +272,11 @@ class GRPOConfig(TrainingArguments):
     
     # New intrinsic reward parameters
     epi_reward_mode: str = field(
-        default="eos", 
+        default="all", 
         metadata={
-            "help": "Mode for intrinsic reward: 'eos' or 'n_token'. "
-            "'eos' uses the final token, while 'n_token' uses the last n tokens."
+            "help": "Mode for intrinsic reward: 'eos', 'n_token', or 'all'. "
+            "'eos' uses the final token, while 'n_token' uses the last n tokens. "
+            "'all' uses all completion tokens."
         }
     )
     epi_reward_n: int = field(

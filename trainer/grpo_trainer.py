@@ -649,9 +649,13 @@ class GRPOTrainer(Trainer):
         # Decide which intrinsic reward(s) to add based on the configuration
         if self.args.intrinsic_reward_type in ["epistemic", "both"]:
             epi_reward = self.compute_intrinsic_reward(prompt_ids, completion_ids, attention_mask)
+            # Gather the epistemic rewards across all processes to match extrinsic_rewards size
+            epi_reward = gather(epi_reward)
             exploration_bonus = exploration_bonus + self.args.epi_reward_lambda * epi_reward
         if self.args.intrinsic_reward_type in ["aleatoric", "both"]:
             alea_reward = self.compute_aleatoric_reward(prompt_ids, completion_ids, attention_mask)
+            # Gather the aleatoric rewards across all processes to match extrinsic_rewards size
+            alea_reward = gather(alea_reward)
             exploration_bonus = exploration_bonus + self.args.aleatoric_reward_lambda * alea_reward
         
         rewards = extrinsic_rewards + exploration_bonus
@@ -689,6 +693,13 @@ class GRPOTrainer(Trainer):
 
         self._metrics["reward"].append(rewards.mean().item())
         self._metrics["reward_std"].append(std_grouped_rewards.mean().item())
+        
+        # Log epistemic and aleatoric rewards when applicable
+        if self.args.intrinsic_reward_type in ["epistemic", "both"] and 'epi_reward' in locals():
+            self._metrics["epistemic_reward"].append(epi_reward.mean().item())
+            
+        if self.args.intrinsic_reward_type in ["aleatoric", "both"] and 'alea_reward' in locals():
+            self._metrics["aleatoric_reward"].append(alea_reward.mean().item())
 
         if (
             self.log_completions
@@ -704,6 +715,13 @@ class GRPOTrainer(Trainer):
                 "completion": gather_object(completions_text),
                 "reward": rewards.tolist(),
             }
+            
+            # Add intrinsic rewards to the table when applicable
+            if self.args.intrinsic_reward_type in ["epistemic", "both"] and 'epi_reward' in locals():
+                table["epistemic_reward"] = epi_reward.tolist()
+                
+            if self.args.intrinsic_reward_type in ["aleatoric", "both"] and 'alea_reward' in locals():
+                table["aleatoric_reward"] = alea_reward.tolist()
             df = pd.DataFrame(table)
 
             if wandb.run is not None and self.accelerator.is_main_process:
