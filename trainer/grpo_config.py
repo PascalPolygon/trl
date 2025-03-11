@@ -123,6 +123,11 @@ class GRPOConfig(TrainingArguments):
             (Default: 0.0 – i.e. by default no intrinsic reward is used)
         epi_reward_num_samples (`int`, *optional*, defaults to `5`):
             Number of forward passes (dropout samples) to estimate the BALD score.
+        intrinsic_reward_type (`str`, *optional*, defaults to `"epistemic"`):
+            Which intrinsic reward to use: `"epistemic"` (based on multiple dropout passes), `"aleatoric"` (based on the
+            single-generation output), or `"both"` (sum the two components).
+        aleatoric_reward_lambda (`float`, *optional*, defaults to `0.0`):
+            Weight for adding the *aleatoric* intrinsic reward to the extrinsic reward.
     """
 
     # Parameters that control the model and reference model
@@ -300,5 +305,15 @@ class GRPOConfig(TrainingArguments):
             "help": "Number of dropout samples for BALD computation. "
             "This parameter is only used when epi_reward_mode is 'n_token'."
         }
+    )
+    intrinsic_reward_type: str = field(
+        default="epistemic",
+        metadata={
+            "help": "Type of intrinsic reward: 'epistemic', 'aleatoric', or 'both'."
+        },
+    )
+    aleatoric_reward_lambda: float = field(
+        default=0.0,
+        metadata={"help": "Weight for the aleatoric intrinsic reward."},
     )
     
