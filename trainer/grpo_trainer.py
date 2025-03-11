@@ -620,7 +620,7 @@ class GRPOTrainer(Trainer):
         for i, (reward_func, reward_processing_class) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes)
         ):
-            if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+            if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel
                 if is_conversational(inputs[0]):
                     messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
                     texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
@@ -631,16 +631,24 @@ class GRPOTrainer(Trainer):
                 )
                 reward_inputs = super()._prepare_inputs(reward_inputs)
                 with torch.inference_mode():
-                    rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+                    rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]
             else:
-                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
                 keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
                 reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
                 output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
-        # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
-        # completions may be distributed across processes
+        extrinsic_rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
+        
+        # ---- Compute intrinsic (epistemic) reward if enabled ----
+        if self.args.epi_reward_lambda > 0:
+            # Compute intrinsic reward from the generated completion (using prompt_ids and completion_ids)
+            intrinsic_rewards = self.compute_intrinsic_reward(prompt_ids, completion_ids, attention_mask)
+            rewards = extrinsic_rewards + self.args.epi_reward_lambda * intrinsic_rewards
+        else:
+            rewards = extrinsic_rewards
+
+        # Gather the reward per function: this part is crucial, because the rewards are normalized per group
         rewards_per_func = gather(rewards_per_func)
 
         # Apply weights to each reward function's output and sum
@@ -702,6 +710,90 @@ class GRPOTrainer(Trainer):
             "advantages": advantages,
         }
 
+    def compute_intrinsic_reward(self, prompt_ids: torch.Tensor, completion_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Compute an intrinsic (epistemic) reward for each generated sample using a BALD-style metric.
+        
+        This function runs the model for M forward passes with dropout enabled (by temporarily setting the model in train mode)
+        and computes, for the generated completion tokens, the difference between the entropy of the average predicted distribution
+        and the average entropy of the individual dropout passes.
+        
+        Depending on self.args.epi_reward_mode:
+          - "eos": uses only the final token of the generated completion.
+          - "n_token": uses the last n tokens (as defined by self.args.epi_reward_n) and averages the token entropies.
+          
+        Returns:
+            A tensor of shape (B,) with the intrinsic reward (BALD score scaled by epi_reward_alpha) for each sample.
+        """
+        device = prompt_ids.device
+        B = prompt_ids.size(0)
+        # Concatenate prompt and completion to form the full input
+        full_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # shape: (B, total_len)
+        total_len = full_ids.size(1)
+        prompt_length = prompt_ids.size(1)
+        comp_length = completion_ids.size(1)
+        
+        # Determine which token positions to consider based on mode
+        if self.args.epi_reward_mode == "eos":
+            # Use only the final token of the completion
+            token_indices = torch.full((B,), prompt_length + comp_length - 1, device=device)  # shape: (B,)
+        elif self.args.epi_reward_mode == "n_token":
+            n = self.args.epi_reward_n
+            # Create indices for the last n tokens (same for every sample)
+            token_indices = torch.arange(prompt_length + comp_length - n, prompt_length + comp_length, device=device)  # shape: (n,)
+        else:
+            raise ValueError(f"Unknown epi_reward_mode: {self.args.epi_reward_mode}")
+
+        M = self.args.epi_reward_num_samples
+        entropy_samples = []
+        probs_samples = []
+
+        model = self.model
+        # Temporarily switch to train mode to enable dropout (but disable gradients)
+        prev_mode = model.training
+        model.train()  # enable dropout
+        with torch.no_grad():
+            for m in range(M):
+                # Run the forward pass
+                outputs = model(full_ids, attention_mask=attention_mask)
+                logits = outputs.logits  # shape: (B, total_len, vocab)
+                if self.args.epi_reward_mode == "eos":
+                    # Extract logits for the final token for each sample
+                    target_logits = logits[:, -1, :]  # shape: (B, vocab)
+                    probs = torch.softmax(target_logits, dim=-1)  # shape: (B, vocab)
+                    entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)  # shape: (B,)
+                else:  # "n_token" mode
+                    n = self.args.epi_reward_n
+                    # Extract logits for the last n tokens
+                    target_logits = logits[:, -n:, :]  # shape: (B, n, vocab)
+                    probs = torch.softmax(target_logits, dim=-1)  # shape: (B, n, vocab)
+                    # Compute per-token entropies and average them over the n tokens
+                    entropy_tokens = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)  # shape: (B, n)
+                    entropy = entropy_tokens.mean(dim=-1)  # shape: (B,)
+                entropy_samples.append(entropy)
+                # For later computing the entropy of the average prediction,
+                # store the probabilities. In "n_token" mode, we average over the n tokens later.
+                probs_samples.append(probs.unsqueeze(0))
+            # Stack the M samples: shape (M, B, ...) depending on mode
+            entropy_stack = torch.stack(entropy_samples, dim=0)  # shape: (M, B)
+            avg_entropy = entropy_stack.mean(dim=0)  # shape: (B,)
+
+            probs_stack = torch.cat(probs_samples, dim=0)  # shape: (M, B, ...) 
+            avg_probs = probs_stack.mean(dim=0)  # shape: (B, vocab) or (B, n, vocab)
+            if self.args.epi_reward_mode == "eos":
+                avg_entropy_full = -torch.sum(avg_probs * torch.log(avg_probs + 1e-10), dim=-1)  # shape: (B,)
+            else:
+                # In "n_token" mode, compute per-token entropy and average over n tokens
+                avg_entropy_tokens = -torch.sum(avg_probs * torch.log(avg_probs + 1e-10), dim=-1)  # shape: (B, n)
+                avg_entropy_full = avg_entropy_tokens.mean(dim=-1)  # shape: (B,)
+        # Restore model mode
+        model.train(prev_mode)
+        # BALD-style score: difference between the entropy of the average prediction and the average entropy
+        bald_score = avg_entropy_full - avg_entropy  # shape: (B,)
+        # Scale the intrinsic reward by epi_reward_alpha
+        intrinsic_reward = self.args.epi_reward_alpha * bald_score  # shape: (B,)
+        return intrinsic_reward
+    
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")

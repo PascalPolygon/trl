@@ -108,6 +108,21 @@ class GRPOConfig(TrainingArguments):
 
         log_completions (`bool`, *optional*, defaults to `False`):
             Whether to log the completions during training.
+        
+        > Parameters that incorporate an intrinsic (epistemic) reward based on a BALD-style measure, inducing entropic-resisance in the GRPO objective.
+        epi_reward_mode (`str`, *optional*, defaults to `"eos"`):
+            Mode for intrinsic reward. Set to `"eos"` to compute the reward using only the final token,
+            or `"n_token"` to average over the last n tokens. (Default: `"eos"`)
+        epi_reward_n (`int`, *optional*, defaults to `1`):
+            If using `"n_token"` mode, number of tokens from the generated completion to consider. (Default: 1)
+        epi_reward_alpha (`float`, *optional*, defaults to `1.0`):
+            Scaling factor applied inside the intrinsic reward computation.
+            (Default: 1.0)
+        epi_reward_lambda (`float`, *optional*, defaults to `0.0`):
+            Weight with which to add the intrinsic reward to the extrinsic reward.
+            (Default: 0.0 – i.e. by default no intrinsic reward is used)
+        epi_reward_num_samples (`int`, *optional*, defaults to `5`):
+            Number of forward passes (dropout samples) to estimate the BALD score.
     """
 
     # Parameters that control the model and reference model
@@ -249,3 +264,41 @@ class GRPOConfig(TrainingArguments):
         default=False,
         metadata={"help": "Whether to log the completions during training."},
     )
+    
+    # New intrinsic reward parameters
+    epi_reward_mode: str = field(
+        default="eos", 
+        metadata={
+            "help": "Mode for intrinsic reward: 'eos' or 'n_token'. "
+            "'eos' uses the final token, while 'n_token' uses the last n tokens."
+        }
+    )
+    epi_reward_n: int = field(
+        default=1, 
+        metadata={
+            "help": "Number of tokens to consider if epi_reward_mode is 'n_token'. "
+            "This parameter is only used when epi_reward_mode is 'n_token'."
+        }
+    )
+    epi_reward_alpha: float = field(
+        default=1.0, 
+        metadata={
+            "help": "Scaling factor for intrinsic reward before weighting. "
+            "This parameter scales the intrinsic reward before it is combined with the extrinsic reward."
+        }
+    )
+    epi_reward_lambda: float = field(
+        default=0.0, 
+        metadata={
+            "help": "Weight for adding the intrinsic reward to extrinsic reward. "
+            "This parameter controls the balance between intrinsic and extrinsic rewards."
+        }
+    )
+    epi_reward_num_samples: int = field(
+        default=5, 
+        metadata={
+            "help": "Number of dropout samples for BALD computation. "
+            "This parameter is only used when epi_reward_mode is 'n_token'."
+        }
+    )
+    
