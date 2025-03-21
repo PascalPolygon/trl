@@ -776,7 +776,19 @@ class GRPOTrainer(Trainer):
 
         model = self.model
         prev_mode = model.training
-        model.train()  # enable dropout
+        
+        model.config.attn_pdrop  = 0.1
+        model.config.resid_pdrop = 0.1
+        model.config.attention_probs_dropout_prob = 0.1
+        model.config.hidden_dropout_prob = 0.1
+        
+        model.config.attention_dropout = 0.1
+        model.config.hidden_dropout = 0.1
+        model.config.embd_pdrop = 0.1
+        model.config.resid_pdrop = 0.1
+        
+        model.train()
+        
         with torch.no_grad():
             for m in range(M):
                 outputs = model(full_ids, attention_mask=attention_mask)
