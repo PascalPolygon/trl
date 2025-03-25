@@ -574,9 +574,13 @@ class GRPOTrainer(Trainer):
         else:
             # Regular generation path
             with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
-                prompt_completion_ids = unwrapped_model.generate(
-                    prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
+                generation_output = unwrapped_model.generate(
+                    prompt_ids,
+                    attention_mask=prompt_mask,
+                    generation_config=self.generation_config,
+                    return_dict_in_generate=True
                 )
+                prompt_completion_ids = generation_output.sequences
 
             # Compute prompt length and extract completion ids
             prompt_length = prompt_ids.size(1)
