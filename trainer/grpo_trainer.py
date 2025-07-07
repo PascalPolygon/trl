@@ -416,6 +416,9 @@ class GRPOTrainer(Trainer):
         self.token_entropy_percentile_threshold = getattr(args, 'token_entropy_percentile_threshold', 0.0)
         self.loss_type = getattr(args, 'loss_type', 'grpo')
         
+        # CRITICAL FIX: Add temperature attribute for consistent logits scaling
+        self.temperature = getattr(args, 'temperature', 1.0)
+        
         # Set steps_per_generation as an attribute on args if not present
         if not hasattr(args, 'steps_per_generation'):
             args.steps_per_generation = 1
@@ -555,6 +558,11 @@ class GRPOTrainer(Trainer):
         logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1).logits
         logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
 
+        # CRITICAL FIX: Apply temperature scaling to match original implementation
+        # Divide logits by sampling temperature like the original _get_per_token_logps_and_entropies
+        temperature = getattr(self, 'temperature', 1.0)
+        logits = logits / temperature
+
         input_ids = input_ids[:, -logits_to_keep:]
         # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
         # See https://github.com/huggingface/trl/issues/2770
@@ -585,6 +593,10 @@ class GRPOTrainer(Trainer):
             logits = logits / temperature
 
             completion_ids = input_ids_batch[:, -logits_to_keep:]
+            # CRITICAL FIX: Slice logits to match completion_ids length
+            # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
+            # See https://github.com/huggingface/trl/issues/2770
+            logits = logits[:, -logits_to_keep:]
             logps = selective_log_softmax(logits, completion_ids)  # compute logprobs
             all_logps.append(logps)
 
@@ -762,25 +774,24 @@ class GRPOTrainer(Trainer):
             num_iterations = getattr(self, 'num_iterations', 1)
             gradient_accumulation_steps = getattr(self.args, 'gradient_accumulation_steps', 1)
             
-            # When using num_iterations == 1 and steps_per_generation <= gradient_accumulation_steps
-            # old_per_token_logps == per_token_logps, so we can skip it's computation here, and use
-            # per_token_logps.detach() instead.
-            if num_iterations > 1 or steps_per_generation > gradient_accumulation_steps:
-                old_per_token_logps = self._get_per_token_logps(
-                    self.model, prompt_completion_ids, attention_mask, logits_to_keep
-                )
-            else:
-                old_per_token_logps = None
+            # CRITICAL FIX: Always compute old_per_token_logps for proper GRPO ratios
+            # The original optimization to skip computation when num_iterations=1 causes ratio=1.0
+            # which breaks GRPO learning. We need proper old vs new policy comparison.
+            old_per_token_logps = self._get_per_token_logps_and_entropies(
+                self.model, prompt_completion_ids, attention_mask, logits_to_keep, compute_entropy=False
+            )["logps"]
             
             if self.ref_model is not None:
-                ref_per_token_logps = self._get_per_token_logps(
-                    self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
-                )
+                # CRITICAL FIX: Use consistent method for temperature scaling
+                ref_per_token_logps = self._get_per_token_logps_and_entropies(
+                    self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep, compute_entropy=False
+                )["logps"]
             else:
                 with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    ref_per_token_logps = self._get_per_token_logps(
-                        self.model, prompt_completion_ids, attention_mask, logits_to_keep
-                    )
+                    # CRITICAL FIX: Use consistent method for temperature scaling
+                    ref_per_token_logps = self._get_per_token_logps_and_entropies(
+                        self.model, prompt_completion_ids, attention_mask, logits_to_keep, compute_entropy=False
+                    )["logps"]
 
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
@@ -1204,7 +1215,11 @@ class GRPOTrainer(Trainer):
             entropy_threshold = torch.quantile(entropies.flatten().float(), token_entropy_percentile_threshold)
             entropy_mask = entropies >= entropy_threshold
         else:
-            per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+            # CRITICAL FIX: Use the same method as original implementation for temperature consistency
+            # Even when not computing entropy, we need temperature scaling
+            per_token_logps = self._get_per_token_logps_and_entropies(
+                model, input_ids, attention_mask, logits_to_keep, compute_entropy=False
+            )["logps"]
             entropy_mask = None
 
         # Compute the KL divergence between the model and the reference model
@@ -1244,7 +1259,8 @@ class GRPOTrainer(Trainer):
         elif loss_type == "dr_grpo":
             loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
         else:
-            loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
+            # CRITICAL FIX: Raise error for unknown loss types instead of silently defaulting
+            raise ValueError(f"Unknown loss type: {loss_type}")
 
         # Log the metrics - handle gather_for_metrics return type gracefully
         def safe_gather_mean(tensor):
