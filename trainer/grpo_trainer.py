@@ -255,7 +255,28 @@ class GRPOTrainer(Trainer):
             model_init_kwargs["use_cache"] = (
                 False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
             )
-            model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
+            
+            # CRITICAL FIX: Use dropout-injected model for BALD to work properly
+            # Check if this is a Qwen model and we need BALD functionality
+            if "qwen" in model.lower() and getattr(args, 'intrinsic_reward_type', None) in ["epistemic", "both"]:
+                try:
+                    from models.qwen_with_dropout import create_qwen_with_dropout
+                    print(f"Loading Qwen model with dropout injection for BALD: {model}")
+                    model = create_qwen_with_dropout(
+                        model,
+                        dropout_p=0.15,  # Standard dropout probability for BALD
+                        torch_dtype=torch_dtype or torch.bfloat16
+                    )
+                    print(f"Successfully loaded Qwen model with dropout injection")
+                except ImportError:
+                    print("WARNING: Could not import create_qwen_with_dropout, falling back to standard model")
+                    model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
+                except Exception as e:
+                    print(f"WARNING: Failed to create dropout-injected model: {e}")
+                    print("Falling back to standard model")
+                    model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
+            else:
+                model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
         else:
             model_id = model.config._name_or_path
             if args.model_init_kwargs is not None:
@@ -334,6 +355,9 @@ class GRPOTrainer(Trainer):
         self.num_generations = args.num_generations  # = G in the GRPO paper
         self.use_vllm = args.use_vllm
 
+        # Reduce beta for stability if not explicitly set
+        if not hasattr(args, 'beta') or args.beta is None:
+            args.beta = 0.01  # Much smaller default KL penalty
         self.beta = args.beta
 
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
@@ -418,6 +442,10 @@ class GRPOTrainer(Trainer):
         
         # CRITICAL FIX: Add temperature attribute for consistent logits scaling
         self.temperature = getattr(args, 'temperature', 1.0)
+        
+        # Add gradient clipping (standard practice for GRPO stability)
+        if not hasattr(args, 'max_grad_norm'):
+            args.max_grad_norm = 1.0  # Standard gradient clipping value
         
         # Set steps_per_generation as an attribute on args if not present
         if not hasattr(args, 'steps_per_generation'):
@@ -553,15 +581,15 @@ class GRPOTrainer(Trainer):
         return RepeatRandomSampler(eval_dataset, self.num_generations, seed=self.args.seed)
 
     # Get the per-token log probabilities for the completions for the model and the reference model
-    def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
+    def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep, apply_temperature=True):
         # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
         logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1).logits
         logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
 
-        # CRITICAL FIX: Apply temperature scaling to match original implementation
-        # Divide logits by sampling temperature like the original _get_per_token_logps_and_entropies
-        temperature = getattr(self, 'temperature', 1.0)
-        logits = logits / temperature
+        # Apply temperature scaling only when requested (for generation, not policy ratios)
+        if apply_temperature:
+            temperature = getattr(self, 'temperature', 1.0)
+            logits = logits / temperature
 
         input_ids = input_ids[:, -logits_to_keep:]
         # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
@@ -774,24 +802,24 @@ class GRPOTrainer(Trainer):
             num_iterations = getattr(self, 'num_iterations', 1)
             gradient_accumulation_steps = getattr(self.args, 'gradient_accumulation_steps', 1)
             
-            # CRITICAL FIX: Always compute old_per_token_logps for proper GRPO ratios
-            # The original optimization to skip computation when num_iterations=1 causes ratio=1.0
-            # which breaks GRPO learning. We need proper old vs new policy comparison.
-            old_per_token_logps = self._get_per_token_logps_and_entropies(
-                self.model, prompt_completion_ids, attention_mask, logits_to_keep, compute_entropy=False
-            )["logps"]
+            # CRITICAL FIX: Compute old_per_token_logps WITHOUT temperature scaling
+            # Temperature should only be applied during generation, not in policy ratio calculation
+            # Use raw logits for proper ratio computation to avoid double temperature scaling
+            old_per_token_logps = self._get_per_token_logps(
+                self.model, prompt_completion_ids, attention_mask, logits_to_keep, apply_temperature=False
+            )
             
             if self.ref_model is not None:
-                # CRITICAL FIX: Use consistent method for temperature scaling
-                ref_per_token_logps = self._get_per_token_logps_and_entropies(
-                    self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep, compute_entropy=False
-                )["logps"]
+                # Use raw logits for reference model (no temperature scaling for KL computation)
+                ref_per_token_logps = self._get_per_token_logps(
+                    self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep, apply_temperature=False
+                )
             else:
                 with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    # CRITICAL FIX: Use consistent method for temperature scaling
-                    ref_per_token_logps = self._get_per_token_logps_and_entropies(
-                        self.model, prompt_completion_ids, attention_mask, logits_to_keep, compute_entropy=False
-                    )["logps"]
+                    # Use raw logits for reference model (no temperature scaling for KL computation)
+                    ref_per_token_logps = self._get_per_token_logps(
+                        self.model, prompt_completion_ids, attention_mask, logits_to_keep, apply_temperature=False
+                    )
 
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
@@ -916,18 +944,26 @@ class GRPOTrainer(Trainer):
         # completions may be distributed across processes
         rewards_per_func_gathered = gather(rewards_per_func)
 
-        # Apply weights to each reward function's output and sum
-        rewards_gathered = (rewards_per_func_gathered * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
+        # CRITICAL FIX: Apply weights to extrinsic rewards AND add intrinsic rewards
+        rewards_extrinsic = (rewards_per_func_gathered * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
+        R_i_gathered = gather(R_i)
+        rewards_combined = rewards_extrinsic + R_i_gathered  # <-- inject intrinsic here
+        
+        # Debug: Log the contribution of intrinsic rewards
+        self._metrics["debug_extrinsic_mean"].append(rewards_extrinsic.mean().item())
+        self._metrics["debug_intrinsic_gathered_mean"].append(R_i_gathered.mean().item())
+        self._metrics["debug_intrinsic_contribution"].append((R_i_gathered.abs() > 1e-6).float().mean().item())  # Fraction non-zero
+        self._metrics["debug_rewards_changed_by_intrinsic"].append((torch.abs(rewards_combined - rewards_extrinsic) > 1e-6).float().mean().item())
 
-        # Compute grouped-wise rewards
-        mean_grouped_rewards = rewards_gathered.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards_gathered.view(-1, self.num_generations).std(dim=1)
+        # Compute grouped-wise rewards using the COMBINED rewards (extrinsic + intrinsic)
+        mean_grouped_rewards = rewards_combined.view(-1, self.num_generations).mean(dim=1)
+        std_grouped_rewards = rewards_combined.view(-1, self.num_generations).std(dim=1)
         is_std_zero = torch.isclose(std_grouped_rewards, torch.zeros_like(std_grouped_rewards))
 
-        # Normalize the rewards to compute the advantages
+        # Normalize the COMBINED rewards to compute the advantages
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = rewards_gathered - mean_grouped_rewards
+        advantages = rewards_combined - mean_grouped_rewards
         if getattr(self, 'scale_rewards', True):
             advantages = advantages / (std_grouped_rewards + 1e-4)
 
@@ -948,26 +984,24 @@ class GRPOTrainer(Trainer):
                 reward_func_name = reward_func.__name__
             self._metrics[f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
 
-        # CRITICAL FIX: Log the gathered rewards for proper global statistics, 
-        # but use LOCAL advantages for training
-        self._metrics["reward"].append(rewards_gathered.mean().item())
-        self._metrics["reward_std"].append(rewards_gathered.std().item())
+        # CRITICAL FIX: Log the COMBINED rewards (extrinsic + intrinsic) for proper global statistics
+        self._metrics["reward"].append(rewards_combined.mean().item())
+        self._metrics["reward_std"].append(rewards_combined.std().item())
         
-        # Debug: Log the difference between local and gathered statistics to monitor the fix
+        # Debug: Log the difference between local and combined statistics to monitor the fix
         self._metrics["debug_local_reward_mean"].append(total_reward.mean().item())
         self._metrics["debug_local_reward_std"].append(total_reward.std().item())
-        self._metrics["debug_gathered_reward_mean"].append(rewards_gathered.mean().item())
-        self._metrics["debug_gathered_reward_std"].append(rewards_gathered.std().item())
+        self._metrics["debug_combined_reward_mean"].append(rewards_combined.mean().item())
+        self._metrics["debug_combined_reward_std"].append(rewards_combined.std().item())
         self._metrics["debug_local_batch_size"].append(len(total_reward))
-        self._metrics["debug_gathered_batch_size"].append(len(rewards_gathered))
+        self._metrics["debug_combined_batch_size"].append(len(rewards_combined))
         
         if self.args.intrinsic_reward_type in ["epistemic", "both"]:
             self._metrics["bald_raw"].append(bald_raw_gathered.mean().item())
         else:
             self._metrics["bald_raw"].append(0.0)
         
-        # Log local intrinsic reward (since R_i is computed locally)
-        R_i_gathered = gather(R_i)
+        # Log intrinsic reward (already gathered above)
         self._metrics["intrinsic_reward"].append(R_i_gathered.mean().item())
 
         # ── 6. Wandb logging (using gathered data for completions table) ──────────────────────────────
@@ -978,14 +1012,14 @@ class GRPOTrainer(Trainer):
         ):
             import pandas as pd
 
-            # For logging - use gathered data for global view
+            # For logging - use combined rewards (extrinsic + intrinsic) for global view
             table = {
-                "step": [str(self.state.global_step)] * len(rewards_gathered),
+                "step": [str(self.state.global_step)] * len(rewards_combined),
                 "prompt": gather_object(prompts_text),
                 "completion": gather_object(completions_text),
-                "reward": rewards_gathered.tolist(),
-                "bald_raw": bald_raw_gathered.tolist() if self.args.intrinsic_reward_type in ["epistemic", "both"] else [0.0] * len(rewards_gathered),
-                "intrinsic_reward": R_i_gathered.tolist() if self.args.intrinsic_reward_type in ["epistemic", "both"] else [0.0] * len(rewards_gathered),
+                "reward": rewards_combined.tolist(),
+                "bald_raw": bald_raw_gathered.tolist() if self.args.intrinsic_reward_type in ["epistemic", "both"] else [0.0] * len(rewards_combined),
+                "intrinsic_reward": R_i_gathered.tolist() if self.args.intrinsic_reward_type in ["epistemic", "both"] else [0.0] * len(rewards_combined),
             }
             
             df = pd.DataFrame(table)
@@ -1069,44 +1103,66 @@ class GRPOTrainer(Trainer):
         
         # CRITICAL FIX: Force dropout even if model doesn't have it natively
         # This is essential for BALD to work with models like Qwen that don't have dropout
-        dropout_prob = 0.1  # Standard dropout probability
+        dropout_prob = 0.15  # Increased dropout probability for more variance
         
         if not has_dropout:
             print(f"WARNING: No dropout modules found in model! Forcing manual dropout with p={dropout_prob}")
-            # We'll apply manual dropout to the logits to create variance
 
         variance_checks = []
+        
+        # SIMPLIFIED: With dropout-injected model, just ensure training mode
+        # The create_qwen_with_dropout should have added proper dropout layers
+        
+        # Test variance to verify dropout is working
         with torch.no_grad():
-            for i in range(M):
-                if has_dropout:
-                    # Model has dropout, use it normally
-                    logits = self.model(full_ids, attention_mask=attention_mask).logits
-                else:
-                    # Model has no dropout, apply manual dropout to logits
-                    with torch.enable_grad():  # Enable grad temporarily for dropout
-                        logits = self.model(full_ids, attention_mask=attention_mask).logits
-                        # Apply dropout to logits to create variance between passes
-                        logits = torch.nn.functional.dropout(logits, p=dropout_prob, training=True)
-                
-                logits_sel = logits[:, idx, :]                          # (B, L', V)
-                probs      = torch.softmax(logits_sel, dim=-1)          # (B, L', V)
-                H_tokens   = -(probs * (probs + eps).log()).sum(-1)      # (B, L')
-                entropies_per_pass.append(H_tokens.sum(-1))             # ← SUM over tokens -> (B,)
-                probs_per_pass.append(probs.unsqueeze(0))               # keep for later
-                
-                # Debug: Log variance between passes
-                if i == 1 and len(probs_per_pass) >= 2:
-                    var_check = (probs_per_pass[0] - probs_per_pass[1]).abs().mean().item()
-                    variance_checks.append(var_check)
-                    self._metrics["debug_bald_variance_01"].append(var_check)
-                elif i > 1:
-                    var_check = (probs_per_pass[0] - probs_per_pass[i]).abs().mean().item()
-                    variance_checks.append(var_check)
+            test_logits_1 = self.model(full_ids, attention_mask=attention_mask).logits
+            test_logits_2 = self.model(full_ids, attention_mask=attention_mask).logits
+            test_variance = (test_logits_1 - test_logits_2).abs().mean().item()
+            print(f"DEBUG BALD: Test variance with dropout-injected model: {test_variance:.2e}")
+            self._metrics["debug_bald_test_variance"].append(test_variance)
+            
+            if test_variance < 1e-6:
+                print("WARNING: Very low variance detected! Dropout may not be working properly.")
+                print("Trying to apply additional functional dropout as fallback...")
+        
+        for i in range(M):
+            # Forward pass with dropout enabled (should work with injected dropout layers)
+            logits = self.model(full_ids, attention_mask=attention_mask).logits
+            
+            # Apply additional functional dropout if the injected dropout isn't creating enough variance
+            if test_variance < 1e-6:
+                logits = torch.nn.functional.dropout(logits, p=dropout_prob, training=True)
+            
+            # Detach to avoid gradient computation in the rest of the pipeline
+            logits = logits.detach()
+            
+            logits_sel = logits[:, idx, :]                          # (B, L', V)
+            probs      = torch.softmax(logits_sel, dim=-1)          # (B, L', V)
+            H_tokens   = -(probs * (probs + eps).log()).sum(-1)      # (B, L')
+            entropies_per_pass.append(H_tokens.sum(-1))             # ← SUM over tokens -> (B,)
+            probs_per_pass.append(probs.unsqueeze(0))               # keep for later
+            
+            # Debug: Log variance between passes
+            if i == 1 and len(probs_per_pass) >= 2:
+                var_check = (probs_per_pass[0] - probs_per_pass[1]).abs().mean().item()
+                variance_checks.append(var_check)
+                self._metrics["debug_bald_variance_01"].append(var_check)
+            elif i > 1:
+                var_check = (probs_per_pass[0] - probs_per_pass[i]).abs().mean().item()
+                variance_checks.append(var_check)
 
         avg_variance = sum(variance_checks) / len(variance_checks) if variance_checks else 0.0
         self._metrics["debug_bald_avg_variance"].append(avg_variance)
+        
+        # CRITICAL: Add more detailed variance debugging
         if avg_variance < 1e-6:
             print(f"WARNING: Very low variance between MC passes ({avg_variance:.2e})! BALD may not work properly.")
+            # Log some sample probabilities to debug
+            if len(probs_per_pass) >= 2:
+                p1_sample = probs_per_pass[0][0, 0, :5].tolist()  # First 5 probs of first sample
+                p2_sample = probs_per_pass[1][0, 0, :5].tolist()  # First 5 probs of second sample
+                print(f"Sample probs pass 1: {p1_sample}")
+                print(f"Sample probs pass 2: {p2_sample}")
         else:
             print(f"BALD variance check: {avg_variance:.6f} (good if > 1e-6)")
 
@@ -1206,20 +1262,24 @@ class GRPOTrainer(Trainer):
 
         # Compute the entropy at each position in the completion
         if token_entropy_percentile_threshold > 0.0:
+            # For entropy computation, we can use temperature-scaled logits since it's just for masking
             logps_and_entropies = self._get_per_token_logps_and_entropies(
                 model, input_ids, attention_mask, logits_to_keep, compute_entropy=True
             )
-            per_token_logps = logps_and_entropies["logps"]
+            # But use raw logits for the actual policy probabilities used in loss
+            per_token_logps = self._get_per_token_logps(
+                model, input_ids, attention_mask, logits_to_keep, apply_temperature=False
+            )
             entropies = logps_and_entropies["entropies"]
             # compute the entropy threshold across all tokens in the batch
             entropy_threshold = torch.quantile(entropies.flatten().float(), token_entropy_percentile_threshold)
             entropy_mask = entropies >= entropy_threshold
         else:
-            # CRITICAL FIX: Use the same method as original implementation for temperature consistency
-            # Even when not computing entropy, we need temperature scaling
-            per_token_logps = self._get_per_token_logps_and_entropies(
-                model, input_ids, attention_mask, logits_to_keep, compute_entropy=False
-            )["logps"]
+            # CRITICAL FIX: Use raw logits without temperature scaling for policy ratio computation
+            # Temperature scaling should only be applied during generation, not training
+            per_token_logps = self._get_per_token_logps(
+                model, input_ids, attention_mask, logits_to_keep, apply_temperature=False
+            )
             entropy_mask = None
 
         # Compute the KL divergence between the model and the reference model
