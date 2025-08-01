@@ -64,8 +64,71 @@ def self_bleu(preds):
     scores = []
     for i, hyp in enumerate(preds):
         refs = preds[:i] + preds[i+1:]
-        scores.append(sacrebleu.corpus_bleu([hyp], [refs]).score)
-    return float(np.mean(scores))
+        if refs:  # Only compute if there are references
+            scores.append(sacrebleu.corpus_bleu([hyp], [refs]).score)
+    return float(np.mean(scores)) if scores else 0.0
+
+def compute_diversity_metrics(completions):
+    """Compute various diversity metrics for a list of completions."""
+    if not completions or len(completions) < 2:
+        return {
+            "self_bleu": 0.0,
+            "unique_unigrams_ratio": 0.0,
+            "unique_bigrams_ratio": 0.0,
+            "unique_trigrams_ratio": 0.0,
+            "avg_length": 0.0,
+            "length_std": 0.0,
+            "vocab_diversity": 0.0
+        }
+    
+    # Self-BLEU (lower = more diverse)
+    try:
+        self_bleu_score = self_bleu(completions)
+    except:
+        self_bleu_score = 0.0
+    
+    # Tokenize all completions
+    all_words = []
+    lengths = []
+    for comp in completions:
+        words = comp.split()
+        all_words.extend(words)
+        lengths.append(len(words))
+    
+    # Length statistics
+    avg_length = np.mean(lengths) if lengths else 0.0
+    length_std = np.std(lengths) if lengths else 0.0
+    
+    # N-gram diversity ratios
+    unique_unigrams = len(set(all_words))
+    total_unigrams = len(all_words)
+    unique_unigrams_ratio = unique_unigrams / total_unigrams if total_unigrams > 0 else 0.0
+    
+    # Bigrams
+    bigrams = []
+    trigrams = []
+    for comp in completions:
+        words = comp.split()
+        if len(words) >= 2:
+            bigrams.extend([f"{words[i]} {words[i+1]}" for i in range(len(words)-1)])
+        if len(words) >= 3:
+            trigrams.extend([f"{words[i]} {words[i+1]} {words[i+2]}" for i in range(len(words)-2)])
+    
+    unique_bigrams_ratio = len(set(bigrams)) / len(bigrams) if bigrams else 0.0
+    unique_trigrams_ratio = len(set(trigrams)) / len(trigrams) if trigrams else 0.0
+    
+    # Vocabulary diversity (unique words across all completions)
+    vocab_diversity = unique_unigrams_ratio
+    
+    return {
+        "self_bleu": self_bleu_score,
+        "unique_unigrams_ratio": unique_unigrams_ratio,
+        "unique_bigrams_ratio": unique_bigrams_ratio,
+        "unique_trigrams_ratio": unique_trigrams_ratio,
+        "avg_length": avg_length,
+        "length_std": length_std,
+        "vocab_diversity": vocab_diversity
+    }
 
 
 if is_peft_available():
@@ -232,8 +295,8 @@ class GRPOTrainer(Trainer):
             model_name = model_name.split("/")[-1]
             args = GRPOConfig(f"{model_name}-GRPO")
         
-        if not (0.0 <= args.explore_beta <= 10.0):
-            raise ValueError("--explore_beta should be in [0,10]")
+        if not (0.0 <= args.explore_beta <= 10000.0):
+            raise ValueError("--explore_beta should be in [0,10000]")
 
         # Models
         # Trained model
@@ -357,7 +420,7 @@ class GRPOTrainer(Trainer):
 
         # Reduce beta for stability if not explicitly set
         if not hasattr(args, 'beta') or args.beta is None:
-            args.beta = 0.01  # Much smaller default KL penalty
+            args.beta = 0.1  # Increased from 0.01 for better KL control
         self.beta = args.beta
 
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
@@ -393,6 +456,12 @@ class GRPOTrainer(Trainer):
             self.bald_ema_var = torch.tensor(1.0)
             self.bald_ema_steps = torch.tensor(0)  # Step counter for bias correction
             self.ema_beta = 0.99  # decay rate
+
+        # Add EMA tracking for extrinsic rewards similar to BALD
+        self.extrinsic_ema_mean = torch.tensor(0.0)
+        self.extrinsic_ema_var = torch.tensor(1.0)
+        self.extrinsic_ema_steps = torch.tensor(0)  # Step counter for bias correction
+        self.extrinsic_ema_beta = 0.99  # Same decay rate as BALD
 
         # Check if the per_device_train/eval_batch_size * num processes can be divided by the number of generations
         if args.per_device_train_batch_size < self.num_generations:
@@ -446,6 +515,10 @@ class GRPOTrainer(Trainer):
         # Add gradient clipping (standard practice for GRPO stability)
         if not hasattr(args, 'max_grad_norm'):
             args.max_grad_norm = 1.0  # Standard gradient clipping value
+        
+        # Add delta clipping for ratio stability
+        if not hasattr(args, 'delta'):
+            args.delta = 5.0  # Allow at most 5x probability increase
         
         # Set steps_per_generation as an attribute on args if not present
         if not hasattr(args, 'steps_per_generation'):
@@ -581,6 +654,8 @@ class GRPOTrainer(Trainer):
         return RepeatRandomSampler(eval_dataset, self.num_generations, seed=self.args.seed)
 
     # Get the per-token log probabilities for the completions for the model and the reference model
+    # IMPORTANT: apply_temperature should be True to match the temperature used during generation
+    # This prevents ratio explosion in PPO/GRPO loss computation
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep, apply_temperature=True):
         # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
         logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1).logits
@@ -802,23 +877,23 @@ class GRPOTrainer(Trainer):
             num_iterations = getattr(self, 'num_iterations', 1)
             gradient_accumulation_steps = getattr(self.args, 'gradient_accumulation_steps', 1)
             
-            # CRITICAL FIX: Compute old_per_token_logps WITHOUT temperature scaling
-            # Temperature should only be applied during generation, not in policy ratio calculation
-            # Use raw logits for proper ratio computation to avoid double temperature scaling
+            # CRITICAL FIX: Compute old_per_token_logps WITH temperature scaling
+            # Must use the same temperature that was used during generation to avoid ratio explosion
+            # This ensures πold and πnew are in the same probability space
             old_per_token_logps = self._get_per_token_logps(
-                self.model, prompt_completion_ids, attention_mask, logits_to_keep, apply_temperature=False
+                self.model, prompt_completion_ids, attention_mask, logits_to_keep, apply_temperature=True
             )
             
             if self.ref_model is not None:
-                # Use raw logits for reference model (no temperature scaling for KL computation)
+                # Use temperature scaling for reference model to match generation temperature
                 ref_per_token_logps = self._get_per_token_logps(
-                    self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep, apply_temperature=False
+                    self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep, apply_temperature=True
                 )
             else:
                 with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    # Use raw logits for reference model (no temperature scaling for KL computation)
+                    # Use temperature scaling for reference model to match generation temperature
                     ref_per_token_logps = self._get_per_token_logps(
-                        self.model, prompt_completion_ids, attention_mask, logits_to_keep, apply_temperature=False
+                        self.model, prompt_completion_ids, attention_mask, logits_to_keep, apply_temperature=True
                     )
 
         # Decode the generated completions
@@ -859,6 +934,44 @@ class GRPOTrainer(Trainer):
         
         # ── 1. extrinsic reward exactly as before ─────────────────────────────
         R_e = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
+        
+        # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
+        # completions may be distributed across processes
+        rewards_per_func_gathered = gather(rewards_per_func)
+
+        # CRITICAL FIX: Apply weights to extrinsic rewards AND add intrinsic rewards
+        rewards_extrinsic = (rewards_per_func_gathered * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
+        
+        # ---- EMA tracking for extrinsic rewards (similar to BALD EMA) -----
+        # Compute local statistics on gathered extrinsic rewards for consistent EMA across processes
+        extrinsic_local_mean = rewards_extrinsic.mean()
+        extrinsic_local_var = rewards_extrinsic.var(unbiased=False)
+        self._metrics["debug_extrinsic_local_mean"].append(extrinsic_local_mean.item())
+        self._metrics["debug_extrinsic_local_var"].append(extrinsic_local_var.item())
+        
+        # Ensure EMA tensors are on the correct device
+        if self.extrinsic_ema_mean.device != device:
+            self.extrinsic_ema_mean = self.extrinsic_ema_mean.to(device)
+            self.extrinsic_ema_var = self.extrinsic_ema_var.to(device)
+            self.extrinsic_ema_steps = self.extrinsic_ema_steps.to(device)
+        
+        # Increment step counter
+        self.extrinsic_ema_steps += 1
+        
+        # Update EMA with gathered statistics
+        self.extrinsic_ema_mean = self.extrinsic_ema_beta * self.extrinsic_ema_mean + (1 - self.extrinsic_ema_beta) * extrinsic_local_mean
+        self.extrinsic_ema_var = self.extrinsic_ema_beta * self.extrinsic_ema_var + (1 - self.extrinsic_ema_beta) * extrinsic_local_var
+        
+        # Apply bias correction
+        extrinsic_bias_correction = 1 - self.extrinsic_ema_beta ** self.extrinsic_ema_steps
+        extrinsic_corrected_mean = self.extrinsic_ema_mean / extrinsic_bias_correction
+        extrinsic_corrected_var = self.extrinsic_ema_var / extrinsic_bias_correction
+        
+        self._metrics["debug_extrinsic_ema_raw_mean"].append(self.extrinsic_ema_mean.item())
+        self._metrics["debug_extrinsic_ema_raw_var"].append(self.extrinsic_ema_var.item())
+        self._metrics["debug_extrinsic_corrected_mean"].append(extrinsic_corrected_mean.item())
+        self._metrics["debug_extrinsic_corrected_var"].append(extrinsic_corrected_var.item())
+        self._metrics["debug_extrinsic_ema_steps"].append(self.extrinsic_ema_steps.item())
         
         # ── 2. intrinsic BALD  (only if enabled) ──────────────────────────────
         # NOTE: BALD computation will handle its own dropout management internally
@@ -933,6 +1046,12 @@ class GRPOTrainer(Trainer):
             self._metrics["debug_R_i_mean"].append(R_i.mean().item())
             self._metrics["debug_R_i_std"].append(R_i.std().item())
             self._metrics["debug_final_explore_beta"].append(self.args.explore_beta)
+            
+            # Track BALD exploration activity for diversity correlation
+            bald_activity = (bald_pos > 0).float().mean().item()  # Fraction of samples with positive BALD
+            self._metrics["exploration/bald_activity_rate"].append(bald_activity)
+            self._metrics["exploration/bald_mean_magnitude"].append(bald_pos.mean().item())
+            self._metrics["exploration/bald_max_magnitude"].append(bald_pos.max().item())
         else:
             R_i = torch.zeros_like(R_e, device=device)
             self._metrics["debug_intrinsic_disabled"].append(1.0)
@@ -940,12 +1059,6 @@ class GRPOTrainer(Trainer):
         # ── 3. additive mix ──────────────────────────────────────────────────
         total_reward = R_e + R_i
 
-        # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
-        # completions may be distributed across processes
-        rewards_per_func_gathered = gather(rewards_per_func)
-
-        # CRITICAL FIX: Apply weights to extrinsic rewards AND add intrinsic rewards
-        rewards_extrinsic = (rewards_per_func_gathered * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
         R_i_gathered = gather(R_i)
         rewards_combined = rewards_extrinsic + R_i_gathered  # <-- inject intrinsic here
         
@@ -1004,7 +1117,52 @@ class GRPOTrainer(Trainer):
         # Log intrinsic reward (already gathered above)
         self._metrics["intrinsic_reward"].append(R_i_gathered.mean().item())
 
-        # ── 6. Wandb logging (using gathered data for completions table) ──────────────────────────────
+        # ── 6. Compute diversity metrics (ROUGE-L and BLEU) ──────────────────────
+        # Track completion diversity to correlate with BALD exploration effectiveness
+        # Key metrics: self_bleu (lower = more diverse), unique n-gram ratios, length variation
+        all_completions = gather_object(completions_text)
+        all_prompts = gather_object(prompts_text)
+        
+        if self.accelerator.is_main_process and len(all_completions) > 1:
+            # Use comprehensive diversity metrics function
+            diversity_metrics = compute_diversity_metrics(all_completions)
+            
+            # Log all diversity metrics
+            for metric_name, metric_value in diversity_metrics.items():
+                self._metrics[f"diversity/{metric_name}"].append(metric_value)
+            
+            # Compute ROUGE-L during training using prompts as references
+            # This gives us a quality metric during training (higher ROUGE-L = more similar to prompts)
+            try:
+                # Use prompts as pseudo-references to measure how much completions relate to input
+                train_rouge_l = rouge_l(all_completions, all_prompts)
+                self._metrics["train/rougeL_vs_prompts"].append(train_rouge_l)
+            except Exception as e:
+                print(f"Warning: Could not compute training ROUGE-L: {e}")
+                self._metrics["train/rougeL_vs_prompts"].append(0.0)
+            
+            # Additional exploration correlation metrics
+            # Compute diversity per prompt group to correlate with BALD exploration
+            if hasattr(self, 'num_generations') and self.num_generations and len(all_completions) >= self.num_generations:
+                group_diversities = []
+                for i in range(0, len(all_completions), self.num_generations):
+                    group_completions = all_completions[i:i+self.num_generations]
+                    if len(group_completions) >= 2:
+                        group_metrics = compute_diversity_metrics(group_completions)
+                        group_diversities.append(group_metrics["self_bleu"])
+                
+                if group_diversities:
+                    avg_group_diversity = sum(group_diversities) / len(group_diversities)
+                    self._metrics["diversity/group_avg_self_bleu"].append(avg_group_diversity)
+                    
+                    # Standard deviation of group diversities (higher = more variable exploration)
+                    if len(group_diversities) > 1:
+                        group_div_std = (sum((x - avg_group_diversity)**2 for x in group_diversities) / len(group_diversities))**0.5
+                        self._metrics["diversity/group_diversity_std"].append(group_div_std)
+                    else:
+                        self._metrics["diversity/group_diversity_std"].append(0.0)
+
+        # ── 7. Wandb logging (using gathered data for completions table) ──────────────────────────────
         if (
             self.log_completions
             and self.state.global_step % self.args.logging_steps == 0
@@ -1266,19 +1424,19 @@ class GRPOTrainer(Trainer):
             logps_and_entropies = self._get_per_token_logps_and_entropies(
                 model, input_ids, attention_mask, logits_to_keep, compute_entropy=True
             )
-            # But use raw logits for the actual policy probabilities used in loss
+            # Use temperature scaling for policy probabilities to match generation temperature
             per_token_logps = self._get_per_token_logps(
-                model, input_ids, attention_mask, logits_to_keep, apply_temperature=False
+                model, input_ids, attention_mask, logits_to_keep, apply_temperature=True
             )
             entropies = logps_and_entropies["entropies"]
             # compute the entropy threshold across all tokens in the batch
             entropy_threshold = torch.quantile(entropies.flatten().float(), token_entropy_percentile_threshold)
             entropy_mask = entropies >= entropy_threshold
         else:
-            # CRITICAL FIX: Use raw logits without temperature scaling for policy ratio computation
-            # Temperature scaling should only be applied during generation, not training
+            # CRITICAL FIX: Use temperature scaling to match generation temperature for stable ratios
+            # This ensures consistent probability space between πold and πnew
             per_token_logps = self._get_per_token_logps(
-                model, input_ids, attention_mask, logits_to_keep, apply_temperature=False
+                model, input_ids, attention_mask, logits_to_keep, apply_temperature=True
             )
             entropy_mask = None
 
@@ -1300,7 +1458,7 @@ class GRPOTrainer(Trainer):
         coef_1 = torch.exp(per_token_logps - old_per_token_logps)
         coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
 
-        # Two-sided clipping
+        # Two-sided clipping for ratio stability
         if hasattr(self.args, 'delta') and self.args.delta is not None:
             coef_1 = torch.clamp(coef_1, max=self.args.delta)
 
@@ -1351,6 +1509,11 @@ class GRPOTrainer(Trainer):
 
         self._metrics["clip_fraction"].append(safe_gather_mean(clip_ratio))
         self._metrics["ratio_mean"].append(safe_gather_mean(coef_1.mean()))
+        
+        # Additional stability metrics
+        self._metrics["ratio_std"].append(safe_gather_mean(coef_1.std()))
+        self._metrics["ratio_max"].append(safe_gather_mean(coef_1.max()))
+        self._metrics["ratio_min"].append(safe_gather_mean(coef_1.min()))
 
         return loss
 
@@ -1409,11 +1572,55 @@ class GRPOTrainer(Trainer):
                                         temperature=0.7)
             gen_txt = self.processing_class.decode(gen_ids[0], skip_special_tokens=True)
             preds.append(gen_txt); refs.append(ref)
-        rl   = rouge_l(preds, refs)      # ROUGE-L F1
-        sbleu = self_bleu(preds)         # self-BLEU (lower is better)
+        
+        # Compute quality and diversity metrics
+        try:
+            rl = rouge_l(preds, refs)      # ROUGE-L F1 (quality metric)
+            self._metrics["eval/rougeL"].append(rl)
+        except Exception as e:
+            print(f"Warning: Could not compute ROUGE-L: {e}")
+            rl = 0.0
+            self._metrics["eval/rougeL"].append(0.0)
+        
+        try:
+            sbleu = self_bleu(preds)       # self-BLEU (diversity metric - lower is better)
+            self._metrics["eval/selfBLEU"].append(sbleu)
+        except Exception as e:
+            print(f"Warning: Could not compute self-BLEU: {e}")
+            sbleu = 0.0
+            self._metrics["eval/selfBLEU"].append(0.0)
+        
+        # Additional diversity metrics for evaluation
+        if len(preds) > 0:
+            # Average completion length
+            pred_lengths = [len(pred.split()) for pred in preds]
+            avg_length = sum(pred_lengths) / len(pred_lengths)
+            self._metrics["eval/avg_completion_length"].append(avg_length)
+            
+            # Vocabulary diversity (unique words / total words)
+            all_words = " ".join(preds).split()
+            vocab_diversity = len(set(all_words)) / len(all_words) if all_words else 0.0
+            self._metrics["eval/vocab_diversity"].append(vocab_diversity)
+            
+            # N-gram diversity
+            if len(all_words) > 1:
+                bigrams = [f"{all_words[i]} {all_words[i+1]}" for i in range(len(all_words)-1)]
+                bigram_diversity = len(set(bigrams)) / len(bigrams) if bigrams else 0.0
+                self._metrics["eval/bigram_diversity"].append(bigram_diversity)
+            else:
+                self._metrics["eval/bigram_diversity"].append(0.0)
 
-        wandb.log({"eval/rougeL": rl, "eval/selfBLEU": sbleu,
-                "global_step": self.state.global_step})
+        # Log to wandb if available
+        if is_wandb_available() and wandb.run is not None:
+            wandb.log({
+                "eval/rougeL": rl, 
+                "eval/selfBLEU": sbleu,
+                "eval/avg_completion_length": avg_length if len(preds) > 0 else 0.0,
+                "eval/vocab_diversity": vocab_diversity if len(preds) > 0 else 0.0,
+                "eval/bigram_diversity": bigram_diversity if len(preds) > 0 and len(all_words) > 1 else 0.0,
+                "global_step": self.state.global_step
+            })
+        
         self.model.train(prev_mode)      # restore dropout state
 
     def create_model_card(
